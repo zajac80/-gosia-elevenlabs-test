@@ -1,0 +1,6 @@
+{
+  "name": "gosia-elevenlabs-test",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-02",
+  "workers_dev": true
+}
