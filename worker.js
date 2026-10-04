@@ -86,9 +86,32 @@ export default class VoiceWorker extends WorkerEntrypoint {
   }
 }
 
-// Obie metody RPC są dostępne tylko dla Workerów z Service Binding.
-// Publiczny handler fetch nadal obsługuje wyłącznie stronę i /tts.
+// Nazwany entrypoint jest dostępny przez GOSIA_USAGE, nie przez publiczny URL.
+// Odczyt HTTP omija problem anulowanych wywołań RPC getUsage.
+// Default VoiceWorker nadal obsługuje tylko / i /tts; bez ujawniania salda publicznie.
 export class AccountUsage extends WorkerEntrypoint {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (request.method !== 'GET' || url.pathname !== '/internal/usage') {
+      return plain('Nie znaleziono', 404);
+    }
+    try {
+      const usage = await readAccountUsage(this.env);
+      return new Response(JSON.stringify(usage), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Nieznany błąd odczytu subskrypcji';
+      console.error('Odczyt konta ElevenLabs:', message);
+      return new Response(JSON.stringify({ error: message }), {
+        status: 502,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }
+      });
+    }
+  }
+
+  // Zachowane wyłącznie dla zgodności z poprzednią wersją wywołującą RPC.
   async getUsage() {
     return readAccountUsage(this.env);
   }
@@ -97,7 +120,8 @@ export class AccountUsage extends WorkerEntrypoint {
 async function readAccountUsage(env) {
   if (!env.ELEVENLABS_API_KEY) throw new Error('Brak klucza ElevenLabs');
   const response = await fetch('https://api.elevenlabs.io/v1/user/subscription', {
-    headers: { 'xi-api-key': env.ELEVENLABS_API_KEY, accept: 'application/json' }
+    headers: { 'xi-api-key': env.ELEVENLABS_API_KEY, accept: 'application/json' },
+    signal: AbortSignal.timeout(8000)
   });
   if (!response.ok) throw new Error(`ElevenLabs usage HTTP ${response.status}`);
   const data = await response.json();
