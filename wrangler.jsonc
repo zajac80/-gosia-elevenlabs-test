@@ -1,6 +1,12 @@
 {
+  "$schema": "https://developers.cloudflare.com/workers/wrangler/config-schema.json",
   "name": "gosia-elevenlabs-test",
-  "main": "worker.js",
-  "compatibility_date": "2026-10-02",
-  "workers_dev": true
+  "main": "./worker.js",
+  "compatibility_date": "2026-10-03",
+  "workers_dev": true,
+  "kv_namespaces": [
+    {
+      "binding": "GOSIA_AUDIO_LIB"
+    }
+  ]
 }

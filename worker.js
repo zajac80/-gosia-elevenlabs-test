@@ -3,6 +3,89 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 
 const VOICE_ID = 'pNInz6obpgDQGcFmaJgB'; // Adam, wybór zaakceptowany w teście.
 const MAX_TEXT = 300;
+// Publiczny katalog zatwierdzonych komunikatów. Nigdy nie umieszczamy tutaj
+// nazwisk, danych pobytu ani wiadomości podanych przez gości.
+const SHARED_PROMPTS = new Set([
+  'Cześć Justynko, słucham rezerwacji.',
+  'Wprowadziłem dane. Sprawdź podgląd rezerwacji. Czy coś jeszcze zmienić?',
+  'Czy zatwierdzić rezerwację? Powiedz „zatwierdź”.',
+  'Nie usłyszałem jeszcze danych rezerwacji. Mów dalej.',
+  'Nie zmieniły się dane w podglądzie. Podaj nową wartość jeszcze raz.',
+  'Czy dodać łóżeczko do rezerwacji? Powiedz tak albo nie.',
+  'Czy dodać krzesełko do rezerwacji? Powiedz tak albo nie.',
+  'Czy dodać psa do rezerwacji? Powiedz tak albo nie.',
+  'Podana data przyjazdu już minęła. Popraw rok albo termin.',
+  'Niektóre dane wymagają poprawki. Sprawdź podgląd i dopowiedz brakujące informacje.'
+]);
+const TTS_MODEL = 'eleven_multilingual_v2';
+// Zmiana głosu, modelu lub formatu automatycznie oddziela bibliotekę.
+const AUDIO_VERSION = 'v1-mp3';
+const inflightAudio = new Map(); // Deduplikacja równoczesnych żądań w jednym procesie.
+
+async function sharedKey(text) {
+  const payload = new TextEncoder().encode(`${AUDIO_VERSION}|${VOICE_ID}|${TTS_MODEL}|${text}`);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', payload));
+  return `${AUDIO_VERSION}/${VOICE_ID}/${Array.from(digest, n => n.toString(16).padStart(2, '0')).join('')}.mp3`;
+}
+
+async function generateSpeech(text, env) {
+  let response;
+  try {
+    response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
+      method: 'POST',
+      headers: { 'xi-api-key': env.ELEVENLABS_API_KEY, 'content-type': 'application/json', 'accept': 'audio/mpeg' },
+      body: JSON.stringify({ text, model_id: TTS_MODEL })
+    });
+  } catch { return plain('Nie udało się połączyć z ElevenLabs', 502); }
+  if (!response.ok) return plain(`ElevenLabs nie wygenerował nagrania. Kod HTTP: ${response.status}`, 502);
+  return response;
+}
+
+const audioResponse = (body, source) => new Response(body, { headers: {
+  'content-type': 'audio/mpeg', 'cache-control': 'no-store',
+  'x-content-type-options': 'nosniff', 'x-gosia-audio-source': source
+} });
+
+async function standardClip(text, env) {
+  const namespace = env.GOSIA_AUDIO_LIB;
+  // Jeżeli nie ma KV, dalej działa generowanie głosu: bez współdzielonej pamięci.
+  if (!namespace) return generateSpeech(text, env);
+  const key = await sharedKey(text);
+  try {
+    const stored = await namespace.get(key, { type: 'arrayBuffer', cacheTtl: 30 });
+    if (stored) return audioResponse(stored, 'shared');
+  } catch (error) {
+    console.error('KV odczyt nagrania:', String(error));
+    // Tymczasowa awaria KV nie może wyłączyć głosu.
+    return generateSpeech(text, env);
+  }
+  let producing = inflightAudio.get(key);
+  if (!producing) {
+    producing = (async () => {
+      const speech = await generateSpeech(text, env);
+      if (!speech.ok) return speech;
+      const bytes = await speech.arrayBuffer();
+      if (!bytes.byteLength || bytes.byteLength > 2 * 1024 * 1024) {
+        return audioResponse(bytes, 'new-not-stored');
+      }
+      try {
+        // Obiekt prywatny, brak publicznego adresu KV. Tylko zatwierdzone frazy.
+        await namespace.put(key, bytes);
+      } catch (error) {
+        console.error('KV zapis nagrania:', String(error));
+      }
+      return audioResponse(bytes, 'new');
+    })();
+    inflightAudio.set(key, producing);
+  }
+  try {
+    const r = await producing;
+    // Response.body może być przeczytane przez jednego odbiorcę; kopiujemy bajty.
+    if (!r.ok) return r.clone();
+    return audioResponse(await r.clone().arrayBuffer(), r.headers.get('x-gosia-audio-source') || 'new');
+  } finally { if (inflightAudio.get(key) === producing) inflightAudio.delete(key); }
+}
+
 
 const html = `<!doctype html>
 <html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -67,18 +150,11 @@ export default class VoiceWorker extends WorkerEntrypoint {
     } catch { return plain('Niepoprawne dane', 400); }
     const text = body?.text;
     if (typeof text !== 'string' || !text.trim() || text.length > MAX_TEXT) return plain('Wpisz od 1 do 300 znaków', 400);
-    let response;
-    try {
-      response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
-        method: 'POST',
-        headers: { 'xi-api-key': env.ELEVENLABS_API_KEY, 'content-type': 'application/json', 'accept': 'audio/mpeg' },
-        body: JSON.stringify({ text: text.trim(), model_id: 'eleven_multilingual_v2' })
-      });
-    } catch { return plain('Nie udało się połączyć z ElevenLabs', 502); }
-    if (!response.ok) return plain(`ElevenLabs nie wygenerował nagrania. Kod HTTP: ${response.status}`, 502);
-    return new Response(response.body, { headers: {
-      'content-type': 'audio/mpeg', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff'
-    } });
+    const phrase = text.trim();
+    if (SHARED_PROMPTS.has(phrase)) return standardClip(phrase, env);
+    const response = await generateSpeech(phrase, env);
+    if (!response.ok) return response;
+    return audioResponse(response.body, 'private-no-store');
   }
 
   async getUsage() {
