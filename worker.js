@@ -87,35 +87,15 @@ async function standardClip(text, env) {
 }
 
 
-const html = `<!doctype html>
-<html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gosia — test głosu ElevenLabs</title><style>
-body{font:17px/1.5 system-ui,sans-serif;max-width:600px;margin:32px auto;padding:0 20px;color:#183047}
-h1{font-size:26px}textarea{box-sizing:border-box;width:100%;height:150px;font:inherit;padding:12px;border:1px solid #9aabb9;border-radius:10px}
-button{font:600 18px system-ui;padding:14px 22px;background:#1765b3;color:white;border:0;border-radius:10px}
-button:disabled{opacity:.5}audio{margin-top:16px;width:100%}#status{white-space:pre-wrap;overflow-wrap:anywhere}
-</style></head><body>
-<h1>Gosia — test głosu</h1><p>Testujemy naturalną polską wymowę głosu Adam. To osobny test; rezerwacje Osady Skandia pozostają bez zmian.</p>
-<label for="text">Tekst do odczytania (do 300 znaków)</label>
-<textarea id="text" maxlength="300">Dzień dobry. Przygotowałam rezerwację w Osadzie Skandia. Przyjazd osiemnastego lipca, wyjazd dwudziestego lipca. Czy zatwierdzić rezerwację?</textarea>
-<p><button id="play" type="button">Odtwórz głos</button></p><p id="status" role="status" aria-live="polite"></p><audio id="audio" controls playsinline></audio>
-<script>
-const btn=document.querySelector('#play'),status=document.querySelector('#status'),audio=document.querySelector('#audio');
-let previousURL;
-btn.addEventListener('click',async()=>{
- btn.disabled=true;status.textContent='Trwa generowanie głosu…';
- try{
-  const r=await fetch('/tts',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:document.querySelector('#text').value})});
-  if(!r.ok)throw Error(await r.text());
-  const blob=await r.blob();
-  if(previousURL)URL.revokeObjectURL(previousURL);
-  previousURL=URL.createObjectURL(blob);audio.src=previousURL;
-  status.textContent='Głos gotowy. Jeśli iPhone nie uruchomi go automatycznie, naciśnij Play poniżej.';
-  try{await audio.play()}catch{}
- }catch(e){status.textContent='Błąd: '+e.message}
- finally{btn.disabled=false}
-});
-</script></body></html>`;
+async function getCachedStandardClip(text,env) {
+  if(!env.GOSIA_AUDIO_LIB) return null;
+  try {
+    const key=await sharedKey(text);
+    return await env.GOSIA_AUDIO_LIB.get(key,{type:'arrayBuffer'});
+  } catch (_) {return null;}
+}
+
+// Public test page intentionally removed: no anonymous paid TTS.
 
 const plain = (message, status) => new Response(message, {
   status,
@@ -128,33 +108,90 @@ export default class VoiceWorker extends WorkerEntrypoint {
   async fetch(request) {
     const env = this.env;
     const url = new URL(request.url);
-    if (request.method === 'GET' && url.pathname === '/') {
-      return new Response(html, { headers: {
-        'content-type': 'text/html; charset=utf-8',
-        'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
-        'referrer-policy': 'no-referrer',
-        'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; media-src blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-      } });
+    const origin = request.headers.get('Origin');
+    const allowedOrigin = 'https://rezerwacje-osada-skandia.whvg7hvk89.workers.dev';
+    const cors = {
+      'Access-Control-Allow-Origin': allowedOrigin,
+      'Access-Control-Allow-Headers': 'authorization, content-type',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      'Access-Control-Max-Age': '600',
+      'Vary': 'Origin', 'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    };
+    const result = (obj, status = 200) => new Response(JSON.stringify(obj), {
+      status, headers: {...cors, 'content-type': 'application/json; charset=utf-8'}
+    });
+    if (origin !== allowedOrigin) return result({error:'forbidden_origin'},403);
+    if(request.method === 'OPTIONS' && ['/tts','/credits'].includes(url.pathname))
+      return new Response(null,{status:204,headers:cors});
+    if (!env.ELEVENLABS_API_KEY || !env.OSADA_ALLOWED_EMAIL)
+      return result({error:'not_configured'},503);
+    if (!((url.pathname === '/credits' && request.method === 'GET') ||
+          (url.pathname === '/tts' && request.method === 'POST')))
+      return result({error:'not_found'},404);
+    const authHeader = request.headers.get('Authorization') || '';
+    const match = /^Bearer ([^\s]{20,4096})$/.exec(authHeader);
+    if (!match) return result({error:'login_required'},401);
+    // Verify with Supabase, not by decoding the unsigned browser JWT body.
+    let user;
+    try {
+      const response = await fetch('https://kzmycvizhalrjtbmyyia.supabase.co/auth/v1/user', {
+        headers: {
+          'apikey':'sb_publishable_FYVgd6qoXwCV7At9AjX0vw_WoGGKKOY',
+          'Authorization':authHeader,
+        },signal:AbortSignal.timeout(6000),cache:'no-store'
+      });
+      if (!response.ok) return result({error:'session_invalid'},401);
+      user = await response.json();
+    } catch (_) {return result({error:'auth_unavailable'},503);}
+    if (!user?.id || !user?.email ||
+        user.email.toLowerCase() !== String(env.OSADA_ALLOWED_EMAIL).trim().toLowerCase() ||
+        !user.email_confirmed_at) return result({error:'forbidden_user'},403);
+    if (url.pathname === '/credits') {
+      try {
+        const usage = await readAccountUsage(env);
+        return result({ ...usage, resetAt: usage.resetAt });
+      } catch (_) { return result({error:'credits_unavailable'},503); }
     }
-    if (url.pathname !== '/tts' || request.method !== 'POST') return plain('Nie znaleziono', 404);
-    // Ograniczenie przeglądarkowe; publiczny endpoint nadal wymaga ochrony przed nadużyciem przy szerszym wdrożeniu.
-    if (request.headers.get('origin') !== url.origin) return plain('Niedozwolone pochodzenie', 403);
-    if (!env.ELEVENLABS_API_KEY) return plain('Nie skonfigurowano sekretu ELEVENLABS_API_KEY', 500);
-    if (!request.headers.get('content-type')?.startsWith('application/json')) return plain('Oczekiwano JSON', 415);
-    if (Number(request.headers.get('content-length') || 0) > 2048) return plain('Za duże żądanie', 413);
-    let body;
+    // Never log user-supplied TTS text. Cap request size and price at the server.
+    if (!request.headers.get('content-type')?.startsWith('application/json')) return result({error:'json_required'},415);
+    if (Number(request.headers.get('content-length') || 0) > 1800) return result({error:'too_large'},413);
+    let text;
     try {
       const raw = await request.text();
-      if (new TextEncoder().encode(raw).length > 2048) return plain('Za duże żądanie', 413);
-      body = JSON.parse(raw);
-    } catch { return plain('Niepoprawne dane', 400); }
-    const text = body?.text;
-    if (typeof text !== 'string' || !text.trim() || text.length > MAX_TEXT) return plain('Wpisz od 1 do 300 znaków', 400);
+      if (new TextEncoder().encode(raw).length > 1800) return result({error:'too_large'},413);
+      text = JSON.parse(raw)?.text;
+    } catch (_) {return result({error:'bad_request'},400);}
+    if (typeof text !== 'string' || !text.trim() || text.length > MAX_TEXT) return result({error:'invalid_text'},400);
     const phrase = text.trim();
-    if (SHARED_PROMPTS.has(phrase)) return standardClip(phrase, env);
-    const response = await generateSpeech(phrase, env);
-    if (!response.ok) return response;
-    return audioResponse(response.body, 'private-no-store');
+    const isReusable = SHARED_PROMPTS.has(phrase);
+    const cached = isReusable ? await getCachedStandardClip(phrase,env) : null;
+    if (cached) return new Response(cached,{status:200,headers:{...cors,
+      'content-type':'audio/mpeg','x-gosia-audio-source':'shared'}});
+    // A real credit balance is read before every NEW clip. Fail closed if usage unavailable.
+    let usage;
+    try { usage = await readAccountUsage(env); }
+    catch (_) {return result({error:'credits_unavailable'},503);}
+    if (usage.remaining < phrase.length * 2 + 25) return result({error:'quota_exhausted'},402);
+    // KV is attached to the existing Worker. No KV -> no paid API calls.
+    const kv=env.GOSIA_AUDIO_LIB;
+    if(!kv) return result({error:'budget_store_missing'},503);
+    const day=new Date().toISOString().slice(0,10);
+    const budgetKey='osada-adam-budget-v98/'+day+'/'+user.id;
+    let count;
+    try {
+      count=Number(await kv.get(budgetKey) || '0');
+      if (!Number.isFinite(count) || count < 0 || count + phrase.length > 1500)
+        return result({error:'daily_limit'},429);
+      // Conservative reservation before generation; concurrency is still not fully atomic.
+      await kv.put(budgetKey, String(count + phrase.length), {expirationTtl:172800});
+    } catch (_) {return result({error:'budget_unavailable'},503);}
+    let speech;
+    if(isReusable) speech=await standardClip(phrase,env);
+    else speech=await generateSpeech(phrase,env);
+    if(!speech.ok) return result({error:'tts_unavailable'},502);
+    return new Response(speech.body,{status:200,headers:{...cors,
+      'content-type':'audio/mpeg'}});
   }
 
   async getUsage() {
